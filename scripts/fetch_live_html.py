@@ -21,6 +21,7 @@ Environment Variables:
 import asyncio
 import json
 import os
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,26 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from playwright.async_api import Page, async_playwright
 
+# Default profile URL to scrape if none provided
+DEFAULT_PROFILE_URL = "https://www.linkedin.com/in/ritajit-majumdar-59683442/"
+
+
+async def human_delay(min_seconds: float = 0.5, max_seconds: float = 10.0) -> None:
+    """
+    Introduce a human-like random delay between actions.
+
+    This helps avoid rate limiting and scraping detection by LinkedIn.
+    The delay follows a slightly weighted distribution toward shorter delays
+    while still having occasional longer pauses.
+    """
+    # Use a beta distribution to weight toward shorter delays but allow longer ones
+    # Beta(2, 5) gives a distribution weighted toward lower values
+    beta_sample = random.betavariate(2, 5)
+    delay = min_seconds + (max_seconds - min_seconds) * beta_sample
+    print(f"   ⏳ Waiting {delay:.1f}s (human-like delay)...")
+    await asyncio.sleep(delay)
+
+
 # Selectors to test from person.py
 SELECTORS_TO_TEST = {
     # Main profile
@@ -39,7 +60,6 @@ SELECTORS_TO_TEST = {
     "location_fallback": ".text-body-small",
     "profile_card": "[data-view-name='profile-card']",
     "open_to_work_img": ".pv-top-card-profile-picture img",
-
     # Section headings
     "experience_heading": "h2:has-text('Experience')",
     "education_heading": "h2:has-text('Education')",
@@ -255,6 +275,9 @@ async def fetch_profile_html(
     if not profile_url.endswith("/"):
         profile_url += "/"
 
+    print(f"\n🕐 Note: Using human-like random delays (0.5-10s) between actions")
+    print(f"   to avoid LinkedIn rate limiting and scraping detection.\n")
+
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -278,31 +301,35 @@ async def fetch_profile_html(
     playwright, browser, context, page = await setup_browser_with_cookie(cookie)
 
     try:
-        for page_name, page_path in PAGES_TO_FETCH:
+        for page_idx, (page_name, page_path) in enumerate(PAGES_TO_FETCH):
             page_url = urljoin(profile_url, page_path)
-            print(f"\n📄 Fetching: {page_name}")
+            print(f"\n📄 Fetching: {page_name} ({page_idx + 1}/{len(PAGES_TO_FETCH)})")
             print(f"   URL: {page_url}")
+
+            # Add human-like delay between page navigations (except for first page)
+            if page_idx > 0:
+                await human_delay(1.0, 5.0)
 
             try:
                 # Navigate to page
                 await page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
 
-                # Wait for main content
+                # Wait for main content with human-like delay
                 try:
                     await page.wait_for_selector("main", timeout=10000)
                 except:
                     print(f"   ⚠️  'main' element not found, continuing anyway...")
 
-                # Additional wait for dynamic content
-                await asyncio.sleep(2)
+                # Human-like wait for dynamic content to load
+                await human_delay(1.5, 4.0)
 
-                # Scroll to load lazy content
+                # Scroll to load lazy content with human-like behavior
                 await page.evaluate(
                     "window.scrollTo(0, document.body.scrollHeight / 2)"
                 )
-                await asyncio.sleep(0.5)
+                await human_delay(0.5, 2.0)
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(1)
+                await human_delay(0.8, 2.5)
 
                 # Save content
                 html_path, screenshot_path = await save_page_content(
@@ -381,15 +408,18 @@ async def fetch_profile_html(
 async def main():
     """Main entry point."""
     if len(sys.argv) < 2:
-        print("Usage: python fetch_live_html.py <profile_url> [output_dir]")
+        print("Usage: python fetch_live_html.py [profile_url] [output_dir]")
         print("\nExample:")
         print("  python fetch_live_html.py https://linkedin.com/in/username")
+        print(f"\nIf no profile URL is provided, defaults to: {DEFAULT_PROFILE_URL}")
         print("\nEnvironment:")
         print("  LINKEDIN_COOKIE: Required - the li_at cookie value")
-        sys.exit(1)
-
-    profile_url = sys.argv[1]
-    output_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("output")
+        # Don't exit - use default profile URL
+        profile_url = DEFAULT_PROFILE_URL
+        output_dir = Path("output")
+    else:
+        profile_url = sys.argv[1]
+        output_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("output")
 
     # Get cookie from environment
     cookie = os.environ.get("LINKEDIN_COOKIE")
@@ -419,6 +449,7 @@ async def main():
     print(f"\n{'=' * 60}")
     print("✅ Done! Check the output directory for HTML files and report.")
     print(f"{'=' * 60}\n")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

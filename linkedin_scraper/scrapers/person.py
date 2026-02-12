@@ -158,70 +158,62 @@ class PersonScraper(BaseScraper):
             return None
 
     async def _get_experiences(self, base_url: str) -> list[Experience]:
-        """Extract experiences from the main profile page Experience section."""
+        """Extract experiences from the details/experience page."""
         experiences = []
 
         try:
-            experience_heading = self.page.locator('h2:has-text("Experience")').first
+            # Always navigate to the details page to get complete experience data
+            # including nested/grouped experiences (multiple roles at same company)
+            exp_url = urljoin(base_url, "details/experience")
+            await self.navigate_and_wait(exp_url)
+            await self.page.wait_for_selector("main", timeout=10000)
+            await self.wait_and_focus(1.5)
 
-            if await experience_heading.count() > 0:
-                experience_section = experience_heading.locator(
-                    "xpath=ancestor::*[.//ul or .//ol][1]"
+            # Wait for experience list items to load
+            try:
+                await self.page.wait_for_selector(
+                    ".pvs-list__paged-list-item", timeout=5000
                 )
-                if await experience_section.count() == 0:
-                    experience_section = experience_heading.locator(
-                        "xpath=ancestor::*[4]"
-                    )
+            except Exception:
+                logger.debug("No experience list items found after waiting")
 
-                if await experience_section.count() > 0:
-                    items = await experience_section.locator("ul > li, ol > li").all()
+            await self.scroll_page_to_half()
+            await self.scroll_page_to_bottom(pause_time=0.5, max_scrolls=5)
 
-                    for item in items:
-                        try:
-                            exp = await self._parse_main_page_experience(item)
-                            if exp:
-                                experiences.append(exp)
-                        except Exception as e:
-                            logger.debug(
-                                f"Error parsing experience from main page: {e}"
-                            )
-                            continue
+            # Wait again after scrolling in case items loaded dynamically
+            await self.wait_and_focus(1)
 
-            if not experiences:
-                exp_url = urljoin(base_url, "details/experience")
-                await self.navigate_and_wait(exp_url)
-                await self.page.wait_for_selector("main", timeout=10000)
-                await self.wait_and_focus(1.5)
-                await self.scroll_page_to_half()
-                await self.scroll_page_to_bottom(pause_time=0.5, max_scrolls=5)
+            items = []
+            main_element = self.page.locator("main")
+            if await main_element.count() > 0:
+                # Get all pvs-list__paged-list-item elements and filter by ID
+                # Top-level items have IDs containing "EXPERIENCE-VIEW-DETAILS-profile"
+                # Nested items have "profilePositionGroup" in their ID
+                all_items = await main_element.locator(
+                    ".pvs-list__paged-list-item"
+                ).all()
 
-                items = []
-                main_element = self.page.locator("main")
-                if await main_element.count() > 0:
-                    list_items = await main_element.locator(
-                        "list > listitem, ul > li"
-                    ).all()
-                    if list_items:
-                        items = list_items
+                for item in all_items:
+                    item_id = await item.get_attribute("id") or ""
+                    # Only include top-level items (not nested position group items)
+                    if "profilePositionGroup" not in item_id:
+                        items.append(item)
 
-                if not items:
-                    old_list = self.page.locator(".pvs-list__container").first
-                    if await old_list.count() > 0:
-                        items = await old_list.locator(
-                            ".pvs-list__paged-list-item"
-                        ).all()
+                logger.debug(
+                    f"Found {len(items)} top-level experience items (filtered from {len(all_items)} total)"
+                )
 
-                for item in items:
-                    try:
-                        result = await self._parse_experience_item(item)
-                        if result:
-                            if isinstance(result, list):
-                                experiences.extend(result)
-                            else:
-                                experiences.append(result)
-                    except Exception as e:
-                        logger.debug(f"Error parsing experience item: {e}")
-                        continue
+            for item in items:
+                try:
+                    result = await self._parse_experience_item(item)
+                    if result:
+                        if isinstance(result, list):
+                            experiences.extend(result)
+                        else:
+                            experiences.append(result)
+                except Exception as e:
+                    logger.debug(f"Error parsing experience item: {e}")
+                    continue
 
         except Exception as e:
             logger.warning(
@@ -233,6 +225,17 @@ class PersonScraper(BaseScraper):
     async def _parse_main_page_experience(self, item) -> Optional[Experience]:
         """Parse experience from main profile page list item with [logo_link, details_link] structure."""
         try:
+            # Check if this is a grouped/nested experience (multiple roles at same company)
+            # These have pvs-entity__sub-components with nested lists
+            sub_components = item.locator(".pvs-entity__sub-components")
+            if await sub_components.count() > 0:
+                # This is a grouped experience - skip it on main page
+                # It will be handled properly by the details page parser
+                logger.debug(
+                    "Skipping grouped experience on main page - will be parsed from details page"
+                )
+                return None
+
             links = await item.locator("a").all()
             if len(links) < 2:
                 return None
@@ -262,6 +265,23 @@ class PersonScraper(BaseScraper):
             ):
                 logger.debug(f"Skipping media attachment: {position_title}")
                 return None
+
+            # Detect if this looks like a grouped experience based on text patterns
+            # Grouped experiences show company name first, then total duration (e.g., "5 yrs 6 mos")
+            # Regular experiences show position title first, then "Company · Employment Type"
+            if len(unique_texts) >= 2:
+                second_text = unique_texts[1]
+                # If second text is just a duration pattern, this is a grouped experience
+                import re
+
+                duration_only_pattern = (
+                    r"^\d+\s+(yr|yrs|mo|mos)(\s+\d+\s+(yr|yrs|mo|mos))?$"
+                )
+                if re.match(duration_only_pattern, second_text.strip()):
+                    logger.debug(
+                        f"Skipping grouped experience (detected by duration pattern): {position_title}"
+                    )
+                    return None
 
             company_name = unique_texts[1]
             work_times = unique_texts[2] if len(unique_texts) > 2 else ""
@@ -314,130 +334,151 @@ class PersonScraper(BaseScraper):
     async def _parse_experience_item(self, item):
         """Parse experience item. Returns Experience or list for nested positions."""
         try:
-            links = await item.locator("a, link").all()
-            if len(links) >= 2:
-                company_url = await links[0].get_attribute("href")
-                detail_link = links[1]
+            # Get company URL from first link
+            company_link = item.locator("a").first
+            company_url = ""
+            if await company_link.count() > 0:
+                company_url = await company_link.get_attribute("href") or ""
 
-                generics = await detail_link.locator("generic, span, div").all()
-                texts = []
-                for g in generics:
-                    text = await g.text_content()
-                    if text and text.strip() and len(text.strip()) < 200:
-                        texts.append(text.strip())
+            # Check if this is a nested/grouped experience (multiple roles at same company)
+            sub_components = item.locator(".pvs-entity__sub-components")
+            if await sub_components.count() > 0:
+                # Check for nested list items
+                nested_items = await sub_components.locator(
+                    ".pvs-list__paged-list-item"
+                ).all()
+                if nested_items:
+                    return await self._parse_nested_experience(item, company_url, None)
 
-                unique_texts = list(dict.fromkeys(texts))
-
-                if len(unique_texts) >= 2:
-                    position_title = unique_texts[0]
-
-                    # Skip media attachments (CV, Resume, etc.)
-                    pos_lower = position_title.lower()
-                    if any(
-                        pattern in pos_lower
-                        for pattern in [
-                            ".pdf",
-                            ".doc",
-                            ".docx",
-                            "resume",
-                            "cv_",
-                            "curriculum",
-                        ]
-                    ):
-                        logger.debug(f"Skipping media attachment: {position_title}")
-                        return None
-
-                    company_name = unique_texts[1]
-                    work_times = unique_texts[2] if len(unique_texts) > 2 else ""
-                    location = unique_texts[3] if len(unique_texts) > 3 else ""
-
-                    from_date, to_date, duration = self._parse_work_times(work_times)
-
-                    return Experience(
-                        position_title=position_title,
-                        institution_name=company_name,
-                        linkedin_url=company_url,
-                        from_date=from_date,
-                        to_date=to_date,
-                        duration=duration,
-                        location=location,
-                        description=None,
-                    )
-
+            # Get all aria-hidden spans from this item (only top-level, not nested)
+            # Use the profile-component-entity to scope the search
             entity = item.locator(
                 'div[data-view-name="profile-component-entity"]'
             ).first
             if await entity.count() == 0:
+                # Fallback to item itself
+                entity = item
+
+            aria_spans = await entity.locator('span[aria-hidden="true"]').all()
+
+            # Extract text from each span, filtering appropriately
+            texts = []
+            for span in aria_spans:
+                text = await span.text_content()
+                if text:
+                    text = text.strip()
+                    # Skip empty, very long texts, and duplicates
+                    if text and len(text) < 300 and text not in texts:
+                        texts.append(text)
+
+            if len(texts) == 0:
                 return None
 
-            children = await entity.locator("> *").all()
-            if len(children) < 2:
+            # First text is position title
+            position_title = texts[0]
+
+            # Skip media attachments (CV, Resume, etc.)
+            pos_lower = position_title.lower()
+            if any(
+                pattern in pos_lower
+                for pattern in [
+                    ".pdf",
+                    ".doc",
+                    ".docx",
+                    "resume",
+                    "cv_",
+                    "curriculum",
+                ]
+            ):
+                logger.debug(f"Skipping media attachment: {position_title}")
                 return None
 
-            company_link = children[0].locator("a").first
-            company_url = await company_link.get_attribute("href")
+            # Parse remaining texts to find company, dates, location
+            company_name = ""
+            work_times = ""
+            location = ""
 
-            detail_container = children[1]
-            detail_children = await detail_container.locator("> *").all()
+            for i, text in enumerate(texts[1:], start=1):
+                # Skip standalone employment type texts
+                if text in [
+                    "Full-time",
+                    "Part-time",
+                    "Contract",
+                    "Internship",
+                    "Freelance",
+                    "Self-employed",
+                ]:
+                    continue
 
-            if len(detail_children) == 0:
-                return None
-
-            has_nested_positions = False
-            if len(detail_children) > 1:
-                nested_list = (
-                    await detail_children[1].locator(".pvs-list__container").count()
+                # Check if this is a date pattern (contains month names AND " - " or "Present")
+                # Date patterns look like: "Jan 2023 - Present · 3 yrs 2 mos" or "Jul 2018 - Dec 2022 · 4 yrs 6 mos"
+                has_month = any(
+                    month in text
+                    for month in [
+                        "Jan",
+                        "Feb",
+                        "Mar",
+                        "Apr",
+                        "May",
+                        "Jun",
+                        "Jul",
+                        "Aug",
+                        "Sep",
+                        "Oct",
+                        "Nov",
+                        "Dec",
+                    ]
                 )
-                has_nested_positions = nested_list > 0
+                has_date_range = " - " in text or "Present" in text
+                is_date_pattern = has_month and has_date_range
 
-            if has_nested_positions:
-                return await self._parse_nested_experience(
-                    item, company_url, detail_children
+                # Check if this is a company pattern (contains "·" with employment type)
+                # Company patterns look like: "IBM · Full-time" or "University · Part-time"
+                employment_types = [
+                    "Full-time",
+                    "Part-time",
+                    "Contract",
+                    "Internship",
+                    "Freelance",
+                    "Self-employed",
+                ]
+                is_company_pattern = "·" in text and any(
+                    emp in text for emp in employment_types
                 )
-            else:
-                first_detail = detail_children[0]
-                nested_elements = await first_detail.locator("> *").all()
 
-                if len(nested_elements) == 0:
-                    return None
+                if is_date_pattern:
+                    if not work_times:
+                        work_times = text
+                elif is_company_pattern and not company_name:
+                    # Extract company name from "Company · Employment Type"
+                    company_name = text.split("·")[0].strip()
+                elif not company_name and i == 1:
+                    # Second text (after position title) is usually company
+                    company_name = text
+                elif not location and not is_company_pattern:
+                    # Remaining text might be location
+                    location = text
 
-                span_container = nested_elements[0]
-                outer_spans = await span_container.locator("> *").all()
+            from_date, to_date, duration = self._parse_work_times(work_times)
 
-                position_title = ""
-                company_name = ""
-                work_times = ""
-                location = ""
+            # Try to get description from expandable text box
+            description = ""
+            desc_elem = item.locator(
+                '[data-testid="expandable-text-box"], .pvs-entity__extra-details'
+            ).first
+            if await desc_elem.count() > 0:
+                description = await desc_elem.text_content()
 
-                if len(outer_spans) >= 1:
-                    aria_span = outer_spans[0].locator('span[aria-hidden="true"]').first
-                    position_title = await aria_span.text_content()
-                if len(outer_spans) >= 2:
-                    aria_span = outer_spans[1].locator('span[aria-hidden="true"]').first
-                    company_name = await aria_span.text_content()
-                if len(outer_spans) >= 3:
-                    aria_span = outer_spans[2].locator('span[aria-hidden="true"]').first
-                    work_times = await aria_span.text_content()
-                if len(outer_spans) >= 4:
-                    aria_span = outer_spans[3].locator('span[aria-hidden="true"]').first
-                    location = await aria_span.text_content()
-
-                from_date, to_date, duration = self._parse_work_times(work_times)
-
-                description = ""
-                if len(detail_children) > 1:
-                    description = await detail_children[1].inner_text()
-
-                return Experience(
-                    position_title=position_title.strip(),
-                    institution_name=company_name.strip(),
-                    linkedin_url=company_url,
-                    from_date=from_date,
-                    to_date=to_date,
-                    duration=duration,
-                    location=location.strip(),
-                    description=description.strip() if description else None,
-                )
+            return Experience(
+                position_title=position_title,
+                institution_name=company_name,
+                linkedin_url=company_url,
+                from_date=from_date,
+                to_date=to_date,
+                duration=duration,
+                location=location,
+                description=description.strip() if description else None,
+            )
 
         except Exception as e:
             logger.debug(f"Error parsing experience: {e}")
@@ -453,83 +494,134 @@ class PersonScraper(BaseScraper):
         experiences = []
 
         try:
-            # Get company name from first detail
-            first_detail = detail_children[0]
-            nested_elements = await first_detail.locator("> *").all()
-            if len(nested_elements) == 0:
+            # Get company name from the parent item's first bold text span
+            company_name = ""
+            company_span = item.locator('.t-bold span[aria-hidden="true"]').first
+            if await company_span.count() > 0:
+                company_name = await company_span.text_content()
+                company_name = company_name.strip() if company_name else ""
+
+            # Find all nested position items within pvs-entity__sub-components
+            sub_components = item.locator(".pvs-entity__sub-components").first
+            if await sub_components.count() == 0:
                 return []
 
-            span_container = nested_elements[0]
-            outer_spans = await span_container.locator("> *").all()
-
-            # First span is company name for nested positions
-            company_name = ""
-            if len(outer_spans) >= 1:
-                aria_span = outer_spans[0].locator('span[aria-hidden="true"]').first
-                company_name = await aria_span.text_content()
-
-            # Get the nested list from detail_children[1]
-            nested_container = detail_children[1].locator(".pvs-list__container").first
-            nested_items = await nested_container.locator(
+            # Look for nested list items - they can be in .pvs-list__paged-list-item
+            nested_items = await sub_components.locator(
                 ".pvs-list__paged-list-item"
             ).all()
 
+            if not nested_items:
+                # Fallback: try direct li children
+                nested_items = await sub_components.locator("li").all()
+
             for nested_item in nested_items:
                 try:
-                    # Each nested item has a link with position details
-                    link = nested_item.locator("a").first
-                    link_children = await link.locator("> *").all()
+                    # Get all aria-hidden spans from this nested item
+                    aria_spans = await nested_item.locator(
+                        'span[aria-hidden="true"]'
+                    ).all()
 
-                    if len(link_children) == 0:
+                    if len(aria_spans) == 0:
                         continue
 
-                    # Navigate to get the spans
-                    first_child = link_children[0]
-                    nested_els = await first_child.locator("> *").all()
-                    if len(nested_els) == 0:
+                    # Extract text from each span, filtering out empty/long texts
+                    texts = []
+                    for span in aria_spans:
+                        text = await span.text_content()
+                        if text:
+                            text = text.strip()
+                            # Skip very long texts (descriptions) and empty texts
+                            if text and len(text) < 300:
+                                texts.append(text)
+
+                    # Deduplicate while preserving order
+                    unique_texts = list(dict.fromkeys(texts))
+
+                    if len(unique_texts) == 0:
                         continue
 
-                    spans_container = nested_els[0]
-                    position_spans = await spans_container.locator("> *").all()
+                    # First text is position title
+                    position_title = unique_texts[0]
 
-                    # Extract position details
-                    position_title = ""
+                    # Skip if this is a media attachment
+                    pos_lower = position_title.lower()
+                    if any(
+                        pattern in pos_lower
+                        for pattern in [
+                            ".pdf",
+                            ".doc",
+                            ".docx",
+                            "resume",
+                            "cv_",
+                            "curriculum",
+                        ]
+                    ):
+                        logger.debug(f"Skipping media attachment: {position_title}")
+                        continue
+
+                    # Parse remaining texts to find dates and location
                     work_times = ""
                     location = ""
 
-                    if len(position_spans) >= 1:
-                        aria_span = (
-                            position_spans[0].locator('span[aria-hidden="true"]').first
-                        )
-                        position_title = await aria_span.text_content()
-                    if len(position_spans) >= 2:
-                        aria_span = (
-                            position_spans[1].locator('span[aria-hidden="true"]').first
-                        )
-                        work_times = await aria_span.text_content()
-                    if len(position_spans) >= 3:
-                        aria_span = (
-                            position_spans[2].locator('span[aria-hidden="true"]').first
-                        )
-                        location = await aria_span.text_content()
+                    for text in unique_texts[1:]:
+                        # Skip employment type texts
+                        if text in [
+                            "Full-time",
+                            "Part-time",
+                            "Contract",
+                            "Internship",
+                            "Freelance",
+                            "Self-employed",
+                        ]:
+                            continue
+                        # Look for date patterns (contains month names or year ranges)
+                        if (
+                            " - " in text
+                            or "·" in text
+                            or any(
+                                month in text
+                                for month in [
+                                    "Jan",
+                                    "Feb",
+                                    "Mar",
+                                    "Apr",
+                                    "May",
+                                    "Jun",
+                                    "Jul",
+                                    "Aug",
+                                    "Sep",
+                                    "Oct",
+                                    "Nov",
+                                    "Dec",
+                                ]
+                            )
+                        ):
+                            if not work_times:
+                                work_times = text
+                        elif not location and text != company_name:
+                            # Assume it's a location if it's not dates
+                            location = text
 
-                    # Parse dates
                     from_date, to_date, duration = self._parse_work_times(work_times)
 
-                    # Get description if available
+                    # Try to get description from expandable text box
                     description = ""
-                    if len(link_children) > 1:
-                        description = await link_children[1].inner_text()
+                    desc_elem = nested_item.locator(
+                        '[data-testid="expandable-text-box"], .pvs-entity__extra-details'
+                    ).first
+                    if await desc_elem.count() > 0:
+                        description = await desc_elem.text_content()
 
                     experiences.append(
                         Experience(
-                            position_title=position_title.strip(),
-                            institution_name=company_name.strip(),
+                            position_title=position_title,
+                            institution_name=company_name,
                             linkedin_url=company_url,
                             from_date=from_date,
                             to_date=to_date,
                             duration=duration,
-                            location=location.strip(),
+                            location=location,
                             description=description.strip() if description else None,
                         )
                     )
@@ -992,21 +1084,57 @@ class PersonScraper(BaseScraper):
                 await self.page.wait_for_selector("main", timeout=10000)
                 await self.wait_and_focus(1)
 
+                # Check for empty page
                 nothing_to_see = await self.page.locator(
                     'text="Nothing to see for now"'
                 ).count()
                 if nothing_to_see > 0:
+                    logger.debug(f"No {category}s found (empty page)")
                     continue
 
-                main_list = self.page.locator(
-                    ".pvs-list__container, main ul, main ol"
-                ).first
-                if await main_list.count() == 0:
-                    continue
+                # Try multiple selector strategies to find items
+                items = []
 
-                items = await main_list.locator(".pvs-list__paged-list-item").all()
+                # Strategy 1: Look for pvs-list__paged-list-item directly in main
+                main_element = self.page.locator("main")
+                if await main_element.count() > 0:
+                    items = await main_element.locator(
+                        ".pvs-list__paged-list-item"
+                    ).all()
+                    logger.debug(
+                        f"Strategy 1 ({category}): found {len(items)} items via .pvs-list__paged-list-item"
+                    )
+
+                # Strategy 2: Look in pvs-list__container
                 if not items:
-                    items = await main_list.locator("> li").all()
+                    pvs_container = self.page.locator(".pvs-list__container").first
+                    if await pvs_container.count() > 0:
+                        items = await pvs_container.locator(
+                            ".pvs-list__paged-list-item"
+                        ).all()
+                        logger.debug(
+                            f"Strategy 2 ({category}): found {len(items)} items in pvs-list__container"
+                        )
+
+                # Strategy 3: Look for li elements with profile-component-entity
+                if not items:
+                    items = await main_element.locator(
+                        'li:has([data-view-name="profile-component-entity"])'
+                    ).all()
+                    logger.debug(
+                        f"Strategy 3 ({category}): found {len(items)} items via profile-component-entity"
+                    )
+
+                # Strategy 4: Fall back to any li in main
+                if not items:
+                    items = await main_element.locator("ul > li, ol > li").all()
+                    logger.debug(
+                        f"Strategy 4 ({category}): found {len(items)} items via ul/ol > li"
+                    )
+
+                if not items:
+                    logger.debug(f"No items found for {category}")
+                    continue
 
                 seen_titles = set()
                 for item in items:
@@ -1020,6 +1148,10 @@ class PersonScraper(BaseScraper):
                     except Exception as e:
                         logger.debug(f"Error parsing {category} item: {e}")
                         continue
+
+                logger.debug(
+                    f"Extracted {len([a for a in accomplishments if a.category == category])} {category}s"
+                )
 
             except Exception as e:
                 logger.debug(f"Error getting {category}s: {e}")

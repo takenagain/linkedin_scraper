@@ -3,32 +3,104 @@
 import asyncio
 import functools
 import logging
+import random
 from typing import Any, Callable, Optional, TypeVar, cast
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
-from .exceptions import RateLimitError, ElementNotFoundError, NetworkError
+from playwright.async_api import Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+from .exceptions import ElementNotFoundError, NetworkError, RateLimitError
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar('T')
+# Default delay range for human-like behavior (in seconds)
+DEFAULT_MIN_DELAY = 0.5
+DEFAULT_MAX_DELAY = 10.0
+
+T = TypeVar("T")
+
+
+async def human_delay(
+    min_seconds: float = DEFAULT_MIN_DELAY,
+    max_seconds: float = DEFAULT_MAX_DELAY,
+) -> float:
+    """
+    Add a random human-like delay between actions.
+
+    This helps avoid detection by making scraping behavior more natural
+    and unpredictable, similar to how a real user would interact with
+    the page.
+
+    Args:
+        min_seconds: Minimum delay in seconds (default: 0.5)
+        max_seconds: Maximum delay in seconds (default: 10.0)
+
+    Returns:
+        The actual delay time used (for logging/debugging)
+    """
+    delay = random.uniform(min_seconds, max_seconds)
+    logger.debug(f"Human-like delay: {delay:.2f}s")
+    await asyncio.sleep(delay)
+    return delay
+
+
+async def short_delay(min_seconds: float = 0.3, max_seconds: float = 1.5) -> float:
+    """
+    Add a short random delay for quick actions like clicks.
+
+    Args:
+        min_seconds: Minimum delay in seconds (default: 0.3)
+        max_seconds: Maximum delay in seconds (default: 1.5)
+
+    Returns:
+        The actual delay time used
+    """
+    return await human_delay(min_seconds, max_seconds)
+
+
+async def medium_delay(min_seconds: float = 1.0, max_seconds: float = 4.0) -> float:
+    """
+    Add a medium random delay for navigation or loading.
+
+    Args:
+        min_seconds: Minimum delay in seconds (default: 1.0)
+        max_seconds: Maximum delay in seconds (default: 4.0)
+
+    Returns:
+        The actual delay time used
+    """
+    return await human_delay(min_seconds, max_seconds)
+
+
+async def long_delay(min_seconds: float = 3.0, max_seconds: float = 10.0) -> float:
+    """
+    Add a longer random delay for page transitions or reading.
+
+    Args:
+        min_seconds: Minimum delay in seconds (default: 3.0)
+        max_seconds: Maximum delay in seconds (default: 10.0)
+
+    Returns:
+        The actual delay time used
+    """
+    return await human_delay(min_seconds, max_seconds)
 
 
 def retry_async(
-    max_attempts: int = 3,
-    backoff: float = 2.0,
-    exceptions: tuple = (Exception,)
+    max_attempts: int = 3, backoff: float = 2.0, exceptions: tuple = (Exception,)
 ):
     """
     Decorator for async functions to add retry logic with exponential backoff.
-    
+
     Args:
         max_attempts: Maximum number of retry attempts
         backoff: Backoff multiplier for exponential backoff
         exceptions: Tuple of exceptions to catch and retry
-    
+
     Returns:
         Decorated function with retry logic
     """
+
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -39,7 +111,7 @@ def retry_async(
                 except exceptions as e:
                     last_exception = e
                     if attempt < max_attempts - 1:
-                        wait_time = backoff ** attempt
+                        wait_time = backoff**attempt
                         logger.warning(
                             f"Attempt {attempt + 1}/{max_attempts} failed: {e}. "
                             f"Retrying in {wait_time}s..."
@@ -50,59 +122,80 @@ def retry_async(
                             f"All {max_attempts} attempts failed for {func.__name__}"
                         )
             raise last_exception
+
         return wrapper
+
     return decorator
 
 
 async def detect_rate_limit(page: Page) -> None:
     """
     Detect if LinkedIn has rate limited the session.
-    
+
     Args:
         page: Playwright page object
-        
+
     Raises:
         RateLimitError: If rate limiting is detected
     """
     # Check for common rate limit indicators
-    
+
     # Check URL for security challenges
     current_url = page.url
-    if 'linkedin.com/checkpoint' in current_url or 'authwall' in current_url:
+    if "linkedin.com/checkpoint" in current_url or "authwall" in current_url:
         raise RateLimitError(
             "LinkedIn security checkpoint detected. "
             "You may need to verify your identity or wait before continuing.",
-            suggested_wait_time=3600  # 1 hour
+            suggested_wait_time=3600,  # 1 hour
         )
-    
+
     # Check for CAPTCHA
     try:
-        captcha = await page.locator('iframe[title*="captcha" i], iframe[src*="captcha" i]').count()
+        captcha = await page.locator(
+            'iframe[title*="captcha" i], iframe[src*="captcha" i]'
+        ).count()
         if captcha > 0:
             raise RateLimitError(
                 "CAPTCHA challenge detected. Manual intervention required.",
-                suggested_wait_time=3600
+                suggested_wait_time=3600,
             )
     except Exception:
         pass
-    
-    # Check for rate limit messages
+
+    # Check for rate limit messages in main content area only
+    # Avoid false positives from UI elements like "try again later" buttons
     try:
-        body_text = await page.locator('body').text_content(timeout=1000)
-        if body_text:
-            body_lower = body_text.lower()
-            if any(phrase in body_lower for phrase in [
-                'too many requests',
-                'rate limit',
-                'slow down',
-                'try again later'
-            ]):
+        # Look for rate limit messages in the main content, not full body
+        # This avoids false positives from dialogs, buttons, or footer text
+        main_element = page.locator('[role="main"], main').first
+        main_text = ""
+        if await main_element.count() > 0:
+            main_text = await main_element.text_content(timeout=2000) or ""
+
+        # Also check for dedicated error pages
+        error_heading = await page.locator("h1, h2").first.text_content(timeout=1000)
+
+        texts_to_check = [main_text.lower(), (error_heading or "").lower()]
+
+        for text_lower in texts_to_check:
+            # Only flag if these are clearly error messages (in headings or prominent text)
+            if any(
+                phrase in text_lower
+                for phrase in [
+                    "too many requests",
+                    "rate limit exceeded",
+                    "we're sorry",  # LinkedIn's error page often starts with this
+                ]
+            ):
                 raise RateLimitError(
                     "Rate limit message detected on page.",
-                    suggested_wait_time=1800  # 30 minutes
+                    suggested_wait_time=1800,  # 30 minutes
                 )
     except PlaywrightTimeoutError:
         pass
+    except Exception as e:
+        # Don't fail on detection errors - just log and continue
+        logger.debug(f"Rate limit detection error (non-fatal): {e}")
 
 
 async def wait_for_element_smart(
@@ -110,18 +203,18 @@ async def wait_for_element_smart(
     selector: str,
     timeout: float = 5000,
     state: str = "visible",
-    error_context: Optional[str] = None
+    error_context: Optional[str] = None,
 ) -> None:
     """
     Wait for an element with better error messages.
-    
+
     Args:
         page: Playwright page object
         selector: CSS selector or text selector
         timeout: Timeout in milliseconds
         state: Element state to wait for (visible, attached, hidden, detached)
         error_context: Additional context for error message
-        
+
     Raises:
         ElementNotFoundError: If element is not found with helpful context
     """
@@ -130,7 +223,7 @@ async def wait_for_element_smart(
     except PlaywrightTimeoutError:
         context = f" when {error_context}" if error_context else ""
         suggestions = _get_selector_suggestions(selector)
-        
+
         raise ElementNotFoundError(
             f"Could not find element with selector '{selector}'{context}. "
             f"This may indicate:\n"
@@ -144,28 +237,25 @@ async def wait_for_element_smart(
 
 def _get_selector_suggestions(selector: str) -> str:
     """Get helpful suggestions based on selector type."""
-    if '#' in selector:
+    if "#" in selector:
         return "Tip: ID selectors may be dynamic. Consider using data attributes or text content."
-    elif 'pv-' in selector or 'artdeco' in selector:
+    elif "pv-" in selector or "artdeco" in selector:
         return "Tip: LinkedIn class names change frequently. This selector may need updating."
     return ""
 
 
 async def extract_text_safe(
-    page: Page,
-    selector: str,
-    default: str = "",
-    timeout: float = 2000
+    page: Page, selector: str, default: str = "", timeout: float = 2000
 ) -> str:
     """
     Safely extract text from an element, returning default if not found.
-    
+
     Args:
         page: Playwright page object
         selector: CSS selector
         default: Default value if element not found
         timeout: Timeout in milliseconds
-        
+
     Returns:
         Extracted text or default value
     """
@@ -181,43 +271,57 @@ async def extract_text_safe(
         return default
 
 
-async def scroll_to_bottom(page: Page, pause_time: float = 1.0, max_scrolls: int = 10) -> None:
+async def scroll_to_bottom(
+    page: Page,
+    pause_time: float = 1.0,
+    max_scrolls: int = 10,
+    randomize_pause: bool = True,
+) -> None:
     """
     Scroll to the bottom of the page smoothly with pauses.
-    
+
     Args:
         page: Playwright page object
-        pause_time: Time to pause between scrolls (seconds)
+        pause_time: Base time to pause between scrolls (seconds)
         max_scrolls: Maximum number of scroll attempts
+        randomize_pause: If True, randomize pause time around the base value
     """
     for i in range(max_scrolls):
         # Get current scroll position
-        previous_height = await page.evaluate('document.body.scrollHeight')
-        
+        previous_height = await page.evaluate("document.body.scrollHeight")
+
         # Scroll down
-        await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-        await asyncio.sleep(pause_time)
-        
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+
+        # Use randomized pause for human-like behavior
+        if randomize_pause:
+            actual_pause = random.uniform(pause_time * 0.5, pause_time * 2.0)
+        else:
+            actual_pause = pause_time
+        await asyncio.sleep(actual_pause)
+
         # Check if we've reached the bottom
-        new_height = await page.evaluate('document.body.scrollHeight')
+        new_height = await page.evaluate("document.body.scrollHeight")
         if new_height == previous_height:
             logger.debug(f"Reached bottom after {i + 1} scrolls")
             break
 
 
-async def scroll_to_half(page: Page) -> None:
-    """Scroll to middle of page."""
-    await page.evaluate('window.scrollTo(0, document.body.scrollHeight / 2)')
+async def scroll_to_half(page: Page, add_delay: bool = True) -> None:
+    """Scroll to middle of page with optional delay."""
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+    if add_delay:
+        await short_delay(0.5, 1.5)
 
 
 async def click_see_more_buttons(page: Page, max_attempts: int = 10) -> int:
     """
     Click all 'Show more' / 'See more' buttons on the page.
-    
+
     Args:
         page: Playwright page object
         max_attempts: Maximum number of buttons to click
-        
+
     Returns:
         Number of buttons clicked
     """
@@ -225,30 +329,35 @@ async def click_see_more_buttons(page: Page, max_attempts: int = 10) -> int:
     for _ in range(max_attempts):
         try:
             # Look for common "see more" button patterns
-            see_more = page.locator('button:has-text("See more"), button:has-text("Show more"), button:has-text("show all")').first
-            
+            see_more = page.locator(
+                'button:has-text("See more"), button:has-text("Show more"), button:has-text("show all")'
+            ).first
+
             if await see_more.is_visible(timeout=1000):
+                # Add human-like delay before clicking
+                await short_delay(0.3, 1.0)
                 await see_more.click()
-                await asyncio.sleep(0.5)  # Wait for content to load
+                # Wait for content to load with randomized delay
+                await medium_delay(0.8, 2.0)
                 clicked += 1
             else:
                 break
         except:
             break
-    
+
     if clicked > 0:
         logger.debug(f"Clicked {clicked} 'see more' buttons")
-    
+
     return clicked
 
 
 async def handle_modal_close(page: Page) -> bool:
     """
     Close any popup modals that might be blocking content.
-    
+
     Args:
         page: Playwright page object
-        
+
     Returns:
         True if a modal was closed, False otherwise
     """
@@ -257,32 +366,35 @@ async def handle_modal_close(page: Page) -> bool:
         close_button = page.locator(
             'button[aria-label="Dismiss"], '
             'button[aria-label="Close"], '
-            'button.artdeco-modal__dismiss'
+            "button.artdeco-modal__dismiss"
         ).first
-        
+
         if await close_button.is_visible(timeout=1000):
+            # Add human-like delay before clicking
+            await short_delay(0.2, 0.8)
             await close_button.click()
-            await asyncio.sleep(0.5)
+            # Wait for modal to close
+            await short_delay(0.3, 1.0)
             logger.debug("Closed modal")
             return True
     except:
         pass
-    
+
     return False
 
 
 async def is_page_loaded(page: Page) -> bool:
     """
     Check if page has finished loading.
-    
+
     Args:
         page: Playwright page object
-        
+
     Returns:
         True if page is loaded
     """
     try:
-        state = await page.evaluate('document.readyState')
-        return state == 'complete'
+        state = await page.evaluate("document.readyState")
+        return state == "complete"
     except:
         return False

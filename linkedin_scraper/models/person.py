@@ -1,7 +1,16 @@
 """Pydantic models for LinkedIn Person/Profile data."""
 
 from typing import List, Optional
+
 from pydantic import BaseModel, Field, HttpUrl, field_validator
+
+
+class Skill(BaseModel):
+    """Skill model with optional endorsement count."""
+
+    name: str
+    endorsements: Optional[int] = None
+    category: Optional[str] = None
 
 
 class Interest(BaseModel):
@@ -67,6 +76,7 @@ class Person(BaseModel):
     interests: List[Interest] = Field(default_factory=list)
     accomplishments: List[Accomplishment] = Field(default_factory=list)
     contacts: List[Contact] = Field(default_factory=list)
+    skills: List[Skill] = Field(default_factory=list)
 
     @field_validator("linkedin_url")
     @classmethod
@@ -129,5 +139,6 @@ class Person(BaseModel):
             f"  Title: {self.job_title}\n"
             f"  Location: {self.location}\n"
             f"  Experiences: {len(self.experiences)}\n"
-            f"  Education: {len(self.educations)}>"
+            f"  Education: {len(self.educations)}\n"
+            f"  Skills: {len(self.skills)}>"
         )
